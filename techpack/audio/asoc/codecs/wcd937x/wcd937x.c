@@ -105,6 +105,7 @@ static struct regmap_irq_chip wcd937x_regmap_irq_chip = {
 	.ack_base = WCD937X_DIGITAL_INTR_CLEAR_0,
 	.use_ack = 1,
 	.clear_ack = 1,
+	.mask_writeonly = 1,
 	.type_base = WCD937X_DIGITAL_INTR_LEVEL_0,
 	.runtime_pm = false,
 	.handle_post_irq = wcd937x_handle_post_irq,
@@ -139,11 +140,6 @@ static int wcd937x_handle_post_irq(void *data)
 {
 	struct wcd937x_priv *wcd937x = data;
 	u32 status1 = 0, status2 = 0, status3 = 0;
-
-	/* Clear the ACK registers. Temporary workaround.*/
-	regmap_write(wcd937x->regmap, WCD937X_DIGITAL_INTR_CLEAR_0, 0x0);
-	regmap_write(wcd937x->regmap, WCD937X_DIGITAL_INTR_CLEAR_1, 0x0);
-	regmap_write(wcd937x->regmap, WCD937X_DIGITAL_INTR_CLEAR_2, 0x0);
 
 	regmap_read(wcd937x->regmap, WCD937X_DIGITAL_INTR_STATUS_0, &status1);
 	regmap_read(wcd937x->regmap, WCD937X_DIGITAL_INTR_STATUS_1, &status2);

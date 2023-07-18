@@ -385,6 +385,11 @@ int msm_common_snd_hw_params(struct snd_pcm_substream *substream,
 	struct msm_common_pdata *pdata = msm_common_get_pdata(card);
 	int index = get_mi2s_tdm_auxpcm_intf_index(stream_name);
 	struct clk_cfg intf_clk_cfg;
+#ifndef ENABLE_WSA
+	struct snd_soc_component *component = NULL;
+	struct snd_soc_dai **dais = rtd->dais;
+	int i;
+#endif
 
 	dev_dbg(rtd->card->dev,
 		"%s: substream = %s  stream = %d\n",
@@ -471,6 +476,17 @@ int msm_common_snd_hw_params(struct snd_pcm_substream *substream,
 						__func__, ret);
 					goto done;
 				}
+#ifndef ENABLE_WSA
+				for (i = rtd->num_cpus; i < (rtd->num_cpus + rtd->num_codecs); i++) {
+					component = dais[i]->component;
+					snd_soc_dai_set_fmt(dais[i],
+							SND_SOC_DAIFMT_CBS_CFS |
+							SND_SOC_DAIFMT_I2S);
+					snd_soc_component_set_sysclk(component, 0, 0,
+							intf_clk_cfg.clk_freq_in_hz,
+							SND_SOC_CLOCK_IN);
+				}
+#endif
 			} else {
 				pr_err("%s: unsupported stream name: %s\n",
 					__func__, stream_name);
@@ -601,26 +617,29 @@ static void msm_audio_add_qos_request()
 {
 	int i;
 	int cpu = 0;
+	int ret = 0;
 
 	msm_audio_req = kcalloc(num_possible_cpus(),
 			sizeof(struct dev_pm_qos_request), GFP_KERNEL);
-	if (!msm_audio_req) {
-		pr_err("%s failed to alloc mem for qos req.\n", __func__);
+	if (!msm_audio_req)
 		return;
-	}
 
 	for (i = 0; i < ARRAY_SIZE(audio_core_list); i++) {
 		if (audio_core_list[i] >= num_possible_cpus())
-			pr_err("%s incorrect cpu id: %d specified.\n", __func__, audio_core_list[i]);
+			pr_err("%s incorrect cpu id: %d specified.\n",
+					__func__, audio_core_list[i]);
 		else
 			cpumask_set_cpu(audio_core_list[i], &audio_cpu_map);
 	}
 
 	for_each_cpu(cpu, &audio_cpu_map) {
-		dev_pm_qos_add_request(get_cpu_device(cpu),
-			&msm_audio_req[cpu],
-			DEV_PM_QOS_RESUME_LATENCY,
-			PM_QOS_CPU_LATENCY_DEFAULT_VALUE);
+		ret = dev_pm_qos_add_request(get_cpu_device(cpu),
+				&msm_audio_req[cpu],
+				DEV_PM_QOS_RESUME_LATENCY,
+				PM_QOS_CPU_LATENCY_DEFAULT_VALUE);
+		if (ret < 0)
+			pr_err("%s error (%d) adding resume latency to cpu %d.\n",
+							__func__, ret, cpu);
 		pr_debug("%s set cpu affinity to core %d.\n", __func__, cpu);
 	}
 }
@@ -628,11 +647,15 @@ static void msm_audio_add_qos_request()
 static void msm_audio_remove_qos_request()
 {
 	int cpu = 0;
+	int ret = 0;
 
 	if (msm_audio_req) {
 		for_each_cpu(cpu, &audio_cpu_map) {
-			dev_pm_qos_remove_request(
-				&msm_audio_req[cpu]);
+			ret = dev_pm_qos_remove_request(
+					&msm_audio_req[cpu]);
+			if (ret < 0)
+				pr_err("%s error (%d) removing request from cpu %d.\n",
+							__func__, ret, cpu);
 			pr_debug("%s remove cpu affinity of core %d.\n", __func__, cpu);
 		}
 		kfree(msm_audio_req);
@@ -813,6 +836,10 @@ int msm_channel_map_get(struct snd_kcontrol *kcontrol,
 		} else {
 			chmap = tx_ch;
 			ch_cnt = tx_ch_cnt;
+		}
+		if (ch_cnt > 2) {
+			pr_err("%s: Incorrect channel count: %d\n", ch_cnt);
+			return -EINVAL;
 		}
 		len = sizeof(uint32_t) * (ch_cnt + 1);
 		chmap_data = kzalloc(len, GFP_KERNEL);

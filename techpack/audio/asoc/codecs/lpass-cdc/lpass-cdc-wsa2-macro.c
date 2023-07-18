@@ -797,6 +797,26 @@ static int lpass_cdc_wsa2_macro_get_channel_map(struct snd_soc_dai *dai,
 	return 0;
 }
 
+static void lpass_cdc_wsa2_unmute_interpolator(struct snd_soc_dai *dai)
+{
+	struct snd_soc_component *component = dai->component;
+	uint16_t j = 0, reg = 0, mix_reg = 0;
+
+	switch (dai->id) {
+	case LPASS_CDC_WSA2_MACRO_AIF1_PB:
+	case LPASS_CDC_WSA2_MACRO_AIF_MIX1_PB:
+		for (j = 0; j < NUM_INTERPOLATORS; ++j) {
+			reg = LPASS_CDC_WSA2_RX0_RX_PATH_CTL +
+				(j * LPASS_CDC_WSA2_MACRO_RX_PATH_OFFSET);
+			mix_reg = LPASS_CDC_WSA2_RX0_RX_PATH_MIX_CTL +
+				(j * LPASS_CDC_WSA2_MACRO_RX_PATH_OFFSET);
+
+			snd_soc_component_update_bits(component, reg, 0x10, 0x00);
+			snd_soc_component_update_bits(component, mix_reg, 0x10, 0x00);
+		}
+	}
+}
+
 static int lpass_cdc_wsa2_macro_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 {
 	struct snd_soc_component *component = dai->component;
@@ -843,6 +863,7 @@ static int lpass_cdc_wsa2_macro_mute_stream(struct snd_soc_dai *dai, int mute, i
 		}
 	}
 	lpass_cdc_wsa_pa_on(wsa2_dev, adie_lb);
+	lpass_cdc_wsa2_unmute_interpolator(dai);
 		break;
 	default:
 		break;
@@ -1266,10 +1287,18 @@ static int lpass_cdc_wsa2_macro_config_compander(struct snd_soc_component *compo
 	dev_dbg(component->dev, "%s: event %d compander %d, enabled %d\n",
 		__func__, event, comp + 1, wsa2_priv->comp_enabled[comp]);
 
+	if (comp >= LPASS_CDC_WSA2_MACRO_COMP_MAX || comp < 0) {
+		dev_err(component->dev, "%s: Invalid compander value: %d\n",
+							__func__, comp);
+		return -EINVAL;
+	}
+
 	if (!wsa2_priv->comp_enabled[comp])
 		return 0;
 
 	mode = wsa2_priv->comp_mode[comp];
+	if (mode >= WSA2_MODE_MAX || mode < 0)
+		mode = 0;
 	comp_ctl0_reg = LPASS_CDC_WSA2_COMPANDER0_CTL0 +
 					(comp * LPASS_CDC_WSA2_MACRO_RX_COMP_OFFSET);
 	comp_ctl8_reg = LPASS_CDC_WSA2_COMPANDER0_CTL8 +
@@ -1615,20 +1644,15 @@ static int lpass_cdc_wsa2_macro_spk_boost_event(struct snd_soc_dapm_widget *w,
 	struct snd_soc_component *component =
 				snd_soc_dapm_to_component(w->dapm);
 	u16 boost_path_ctl, boost_path_cfg1;
-	u16 reg, reg_mix;
 
 	dev_dbg(component->dev, "%s %s %d\n", __func__, w->name, event);
 
 	if (!strcmp(w->name, "WSA2_RX INT0 CHAIN")) {
 		boost_path_ctl = LPASS_CDC_WSA2_BOOST0_BOOST_PATH_CTL;
 		boost_path_cfg1 = LPASS_CDC_WSA2_RX0_RX_PATH_CFG1;
-		reg = LPASS_CDC_WSA2_RX0_RX_PATH_CTL;
-		reg_mix = LPASS_CDC_WSA2_RX0_RX_PATH_MIX_CTL;
 	} else if (!strcmp(w->name, "WSA2_RX INT1 CHAIN")) {
 		boost_path_ctl = LPASS_CDC_WSA2_BOOST1_BOOST_PATH_CTL;
 		boost_path_cfg1 = LPASS_CDC_WSA2_RX1_RX_PATH_CFG1;
-		reg = LPASS_CDC_WSA2_RX1_RX_PATH_CTL;
-		reg_mix = LPASS_CDC_WSA2_RX1_RX_PATH_MIX_CTL;
 	} else {
 		dev_err(component->dev, "%s: unknown widget: %s\n",
 			__func__, w->name);
@@ -1641,12 +1665,8 @@ static int lpass_cdc_wsa2_macro_spk_boost_event(struct snd_soc_dapm_widget *w,
 						0x01, 0x01);
 		snd_soc_component_update_bits(component, boost_path_ctl,
 						0x10, 0x10);
-		if ((snd_soc_component_read(component, reg_mix)) & 0x10)
-			snd_soc_component_update_bits(component, reg_mix,
-						0x10, 0x00);
 		break;
 	case SND_SOC_DAPM_POST_PMU:
-		snd_soc_component_update_bits(component, reg, 0x10, 0x00);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		snd_soc_component_update_bits(component, boost_path_ctl,
@@ -2124,7 +2144,12 @@ static int lpass_cdc_wsa2_macro_comp_mode_put(struct snd_kcontrol *kcontrol,
 		idx = LPASS_CDC_WSA2_MACRO_COMP1;
 	if (strnstr(kcontrol->id.name, "RX1", sizeof("WSA2_RX1")))
 		idx = LPASS_CDC_WSA2_MACRO_COMP2;
-	wsa2_priv->comp_mode[idx] =  ucontrol->value.integer.value[0];
+
+	if (ucontrol->value.integer.value[0] < WSA2_MODE_MAX &&
+						ucontrol->value.integer.value[0] >= 0)
+		wsa2_priv->comp_mode[idx] =  ucontrol->value.integer.value[0];
+	else
+		return 0;
 
 	dev_dbg(component->dev, "%s: comp_mode = %d\n", __func__,
 		wsa2_priv->comp_mode[idx]);
@@ -2174,7 +2199,7 @@ static int lpass_cdc_wsa2_macro_rx_mux_put(struct snd_kcontrol *kcontrol,
 			dev_err(wsa2_dev, "%s: AIF reset already\n", __func__);
 			return 0;
 		}
-		if (aif_rst >= LPASS_CDC_WSA2_MACRO_RX_MAX) {
+		if (aif_rst >= LPASS_CDC_WSA2_MACRO_MAX_DAIS) {
 			dev_err(wsa2_dev, "%s: Invalid AIF reset\n", __func__);
 			return 0;
 		}
