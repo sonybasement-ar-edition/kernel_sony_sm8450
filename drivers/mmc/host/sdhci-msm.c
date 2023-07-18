@@ -1,3 +1,8 @@
+/*
+ * NOTE: This file has been modified by Sony Corporation.
+ * Modifications are Copyright 2022 Sony Corporation,
+ * and licensed under the license of the file.
+ */
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * drivers/mmc/host/sdhci-msm.c - Qualcomm SDHCI Platform driver
@@ -30,8 +35,10 @@
 #include "sdhci-pltfm.h"
 #include "cqhci.h"
 #include "../core/core.h"
+#include "../core/card.h"
 #include <linux/crypto-qti-common.h>
 #include <linux/qtee_shmbridge.h>
+#include <trace/hooks/mmc_core.h>
 
 #define CORE_MCI_VERSION		0x50
 #define CORE_VERSION_MAJOR_SHIFT	28
@@ -4762,6 +4769,27 @@ static void sdhci_msm_set_rumi_bus_mode(struct sdhci_host *host)
 	}
 }
 
+static void sdhci_msm_gpio_irqt(void *unused, struct mmc_host *host, bool *allow)
+{
+	host->android_oem_data1 = 0;
+}
+
+static void sdhci_msm_get_cd(void *unused, struct sdhci_host *host, bool *allow)
+{
+	if (host->mmc && host->mmc->android_oem_data1)
+		*allow = false;
+}
+
+static void sdhci_msm_remove_card(void *unused, struct mmc_card *card)
+{
+	if (mmc_card_sd(card)) {
+		pr_info("%s: Removing card\n", mmc_hostname(card->host));
+		mmc_card_set_removed(card);
+		card->host->android_oem_data1 = 1;
+		mmc_detect_change(card->host, msecs_to_jiffies(200));
+	}
+}
+
 static int sdhci_msm_probe(struct platform_device *pdev)
 {
 	struct sdhci_host *host;
@@ -5112,6 +5140,33 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	pm_runtime_mark_last_busy(&pdev->dev);
 	pm_runtime_put_autosuspend(&pdev->dev);
 
+	ret = register_trace_android_vh_mmc_blk_mq_rw_recovery(
+			sdhci_msm_remove_card, NULL);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to register vendor hook (%d)\n", ret);
+		goto exit_vh;
+	}
+
+	ret = register_trace_android_vh_sdhci_get_cd(
+			sdhci_msm_get_cd, NULL);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to register vendor hook (%d)\n", ret);
+		unregister_trace_android_vh_mmc_blk_mq_rw_recovery(
+                        sdhci_msm_remove_card, NULL);
+		goto exit_vh;
+	}
+
+	ret = register_trace_android_vh_mmc_gpio_cd_irqt(
+			sdhci_msm_gpio_irqt, NULL);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to register recovery hook (%d)\n", ret);
+		unregister_trace_android_vh_mmc_blk_mq_rw_recovery(
+                        sdhci_msm_remove_card, NULL);
+		unregister_trace_android_vh_sdhci_get_cd(
+                        sdhci_msm_get_cd, NULL);
+	}
+
+exit_vh:
 	return 0;
 
 pm_runtime_disable:
@@ -5150,6 +5205,13 @@ static int sdhci_msm_remove(struct platform_device *pdev)
 	int i;
 	int dead = (readl_relaxed(host->ioaddr + SDHCI_INT_STATUS) ==
 		    0xffffffff);
+
+	unregister_trace_android_vh_mmc_blk_mq_rw_recovery(
+                        sdhci_msm_remove_card, NULL);
+	unregister_trace_android_vh_sdhci_get_cd(
+                        sdhci_msm_get_cd, NULL);
+	unregister_trace_android_vh_mmc_gpio_cd_irqt(
+                        sdhci_msm_gpio_irqt, NULL);
 
 	sdhci_remove_host(host, dead);
 

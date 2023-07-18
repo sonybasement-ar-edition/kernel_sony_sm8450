@@ -1,5 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
+ * NOTE: This file has been modified by Sony Corporation.
+ * Modifications are Copyright 2021 Sony Corporation,
+ * and licensed under the license of the file.
+ */
+/*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
  * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
@@ -428,6 +433,8 @@ struct cnss_sol_gpio {
 	int host_sol_gpio;
 };
 
+#define SUBSYS_CRASH_REASON_LEN 512
+
 struct cnss_plat_data {
 	struct platform_device *plat_dev;
 	void *bus_priv;
@@ -542,6 +549,7 @@ struct cnss_plat_data {
 	u8 hwid_bitmap;
 	enum cnss_driver_mode driver_mode;
 	u32 num_shadow_regs_v3;
+	char crash_reason_buf[SUBSYS_CRASH_REASON_LEN];
 };
 
 #if IS_ENABLED(CONFIG_ARCH_QCOM)
