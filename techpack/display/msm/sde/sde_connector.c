@@ -20,6 +20,7 @@
 #include "sde_rm.h"
 #include "sde_vm.h"
 #include <drm/drm_probe_helper.h>
+#include <linux/list_sort.h>
 
 #define BL_NODE_NAME_SIZE 32
 #define HDR10_PLUS_VSIF_TYPE_CODE      0x81
@@ -254,7 +255,11 @@ static int sde_backlight_setup(struct sde_connector *c_conn,
 	props.type = BACKLIGHT_RAW;
 	props.power = FB_BLANK_UNBLANK;
 	props.max_brightness = bl_config->brightness_max_level;
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	props.brightness = bl_config->default_brightness_level;
+#else
 	props.brightness = bl_config->brightness_max_level;
+#endif
 	snprintf(bl_node_name, BL_NODE_NAME_SIZE, "panel%u-backlight",
 							display_count);
 	c_conn->bl_device = backlight_device_register(bl_node_name, dev->dev, c_conn,
@@ -1127,7 +1132,7 @@ void sde_connector_helper_bridge_disable(struct drm_connector *connector)
 	/* Disable ESD thread */
 	sde_connector_schedule_status_work(connector, false);
 
-	if (!sde_in_trusted_vm(sde_kms) && c_conn->bl_device) {
+	if (!sde_in_trusted_vm(sde_kms) && c_conn->bl_device && !poms_pending) {
 		c_conn->bl_device->props.power = FB_BLANK_POWERDOWN;
 		c_conn->bl_device->props.state |= BL_CORE_FBBLANK;
 		backlight_update_status(c_conn->bl_device);
@@ -1171,7 +1176,7 @@ void sde_connector_helper_bridge_enable(struct drm_connector *connector)
 				MSM_ENC_TX_COMPLETE);
 	c_conn->allow_bl_update = true;
 
-	if (!sde_in_trusted_vm(sde_kms) && c_conn->bl_device) {
+	if (!sde_in_trusted_vm(sde_kms) && c_conn->bl_device && !display->poms_pending) {
 		c_conn->bl_device->props.power = FB_BLANK_UNBLANK;
 		c_conn->bl_device->props.state &= ~BL_CORE_FBBLANK;
 		backlight_update_status(c_conn->bl_device);
@@ -2500,6 +2505,28 @@ static void sde_connector_early_unregister(struct drm_connector *connector)
 	/* debugfs under connector->debugfs are deleted by drm_debugfs */
 }
 
+static int sde_drm_mode_somc_compare(void *priv, struct list_head *lh_a, struct list_head *lh_b)
+{
+	struct drm_display_mode *a = list_entry(lh_a, struct drm_display_mode, head);
+	struct drm_display_mode *b = list_entry(lh_b, struct drm_display_mode, head);
+	int diff;
+
+	diff = ((b->type & DRM_MODE_TYPE_PREFERRED) != 0) -
+		((a->type & DRM_MODE_TYPE_PREFERRED) != 0);
+	if (diff)
+		return diff;
+	diff = b->hdisplay * b->vdisplay - a->hdisplay * a->vdisplay;
+	if (diff)
+		return -diff;
+
+	diff = drm_mode_vrefresh(b) - drm_mode_vrefresh(a);
+	if (diff)
+		return -diff;
+
+	diff = b->clock - a->clock;
+	return diff;
+}
+
 static int sde_connector_fill_modes(struct drm_connector *connector,
 		uint32_t max_width, uint32_t max_height)
 {
@@ -2514,6 +2541,9 @@ static int sde_connector_fill_modes(struct drm_connector *connector,
 
 	mode_count = drm_helper_probe_single_connector_modes(connector,
 			max_width, max_height);
+
+	if (connector->connector_type == DRM_MODE_CONNECTOR_DSI)
+		list_sort(NULL, &connector->modes, sde_drm_mode_somc_compare);
 
 	if (sde_conn->ops.set_allowed_mode_switch)
 		sde_conn->ops.set_allowed_mode_switch(connector,

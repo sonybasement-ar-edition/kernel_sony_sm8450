@@ -22,6 +22,10 @@
 #include "sde_dbg.h"
 #include "dsi_parser.h"
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+#include "dsi_panel_driver.h"
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 #define to_dsi_display(x) container_of(x, struct dsi_display, host)
 #define INT_BASE_10 10
 
@@ -48,7 +52,11 @@ static struct dsi_display_boot_param boot_displays[MAX_DSI_ACTIVE_DISPLAY] = {
 static void dsi_display_panel_id_notification(struct dsi_display *display);
 
 static const struct of_device_id dsi_display_dt_match[] = {
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	{.compatible = "somc,dsi-display"},
+#else
 	{.compatible = "qcom,dsi-display"},
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 	{}
 };
 
@@ -66,6 +74,13 @@ static bool is_sim_panel(struct dsi_display *display)
 		return false;
 
 	return display->panel->te_using_watchdog_timer;
+}
+
+static struct dsi_display *main_display;
+
+struct dsi_display *dsi_display_get_main_display(void)
+{
+	return main_display;
 }
 
 static void dsi_display_mask_ctrl_error_interrupts(struct dsi_display *display,
@@ -273,7 +288,11 @@ error:
 	return rc;
 }
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+int dsi_display_cmd_engine_enable(struct dsi_display *display)
+#else
 static int dsi_display_cmd_engine_enable(struct dsi_display *display)
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 {
 	int rc = 0;
 	int i;
@@ -315,7 +334,11 @@ done:
 	return rc;
 }
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+int dsi_display_cmd_engine_disable(struct dsi_display *display)
+#else
 static int dsi_display_cmd_engine_disable(struct dsi_display *display)
+#endif  /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 {
 	int rc = 0;
 	int i;
@@ -935,6 +958,18 @@ void dsi_display_toggle_error_interrupt_status(struct dsi_display * display, boo
 		ctrl = &display->ctrl[i];
 		if (!ctrl->ctrl)
 			continue;
+
+		/*
+		 * Make sure not to toggle error status and error interrupts
+		 * while a command transfer is going on.
+		 */
+
+		if (ctrl->ctrl->post_tx_queued) {
+			flush_workqueue(display->post_cmd_tx_workq);
+			cancel_work_sync(&ctrl->ctrl->post_cmd_tx_work);
+			ctrl->ctrl->post_tx_queued = false;
+		}
+
 		dsi_ctrl_toggle_error_interrupt_status(ctrl->ctrl, enable);
 	}
 }
@@ -2784,11 +2819,61 @@ static int dsi_display_set_clk_src(struct dsi_display *display, bool set_xo)
 	return 0;
 }
 
-int dsi_display_phy_pll_toggle(void *priv, bool prepare)
+static int dsi_display_phy_pll_enable(struct dsi_display *display)
 {
 	int rc = 0;
-	struct dsi_display *display = priv;
 	struct dsi_display_ctrl *m_ctrl;
+
+	m_ctrl = &display->ctrl[display->clk_master_idx];
+	if (!m_ctrl->phy) {
+		DSI_ERR("[%s] PHY not found\n", display->name);
+		return -EINVAL;
+	}
+
+	/*
+	 * It is recommended to turn on the PLL before switching parent
+	 * of RCG to PLL because when RCG is on, both the old and new
+	 * sources should be on while switching the RCG parent.
+	 *
+	 * Note: Branch clocks and in turn RCG might not get turned off
+	 * during clock disable sequence if there is a vote from dispcc
+	 * or any of its other consumers.
+	 */
+
+	rc = dsi_phy_pll_toggle(m_ctrl->phy, true);
+	if (rc)
+		return rc;
+
+	return dsi_display_set_clk_src(display, false);
+}
+
+static int dsi_display_phy_pll_disable(struct dsi_display *display)
+{
+	int rc = 0;
+	struct dsi_display_ctrl *m_ctrl;
+
+	/*
+	 * It is recommended to turn off the PLL after switching parent
+	 * of RCG to PLL because when RCG is on, both the old and new
+	 * sources should be on while switching the RCG parent.
+	 */
+
+	rc = dsi_display_set_clk_src(display, true);
+	if (rc)
+		return rc;
+
+	m_ctrl = &display->ctrl[display->clk_master_idx];
+	if (!m_ctrl->phy) {
+		DSI_ERR("[%s] PHY not found\n", display->name);
+		return -EINVAL;
+	}
+
+	return dsi_phy_pll_toggle(m_ctrl->phy, false);
+}
+
+int dsi_display_phy_pll_toggle(void *priv, bool prepare)
+{
+	struct dsi_display *display = priv;
 
 	if (!display) {
 		DSI_ERR("invalid arguments\n");
@@ -2798,17 +2883,10 @@ int dsi_display_phy_pll_toggle(void *priv, bool prepare)
 	if (is_skip_op_required(display))
 		return 0;
 
-	rc = dsi_display_set_clk_src(display, !prepare);
-
-	m_ctrl = &display->ctrl[display->clk_master_idx];
-	if (!m_ctrl->phy) {
-		DSI_ERR("[%s] PHY not found\n", display->name);
-		return -EINVAL;
-	}
-
-	rc = dsi_phy_pll_toggle(m_ctrl->phy, prepare);
-
-	return rc;
+	if (prepare)
+		return dsi_display_phy_pll_enable(display);
+	else
+		return dsi_display_phy_pll_disable(display);
 }
 
 int dsi_display_phy_configure(void *priv, bool commit)
@@ -3533,6 +3611,16 @@ static int dsi_display_clocks_init(struct dsi_display *display)
 
 	num_clk = dsi_display_get_clocks_count(display, dsi_clock_name);
 
+	if (num_clk <= 0) {
+		pll->byte_clk = NULL;
+		pll->pixel_clk = NULL;
+		rc = num_clk;
+		DSI_WARN("failed to read %s, rc = %d\n", dsi_clock_name, rc);
+		goto error;
+	}
+
+	DSI_DEBUG("clk count=%d\n", num_clk);
+
 	for (i = 0; i < num_clk; i++) {
 		dsi_display_get_clock_name(display, dsi_clock_name, i,
 						&clk_name);
@@ -4201,6 +4289,14 @@ static int dsi_display_res_init(struct dsi_display *display)
 			goto error_ctrl_put;
 		}
 	}
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_create_fs(display);
+	if (rc) {
+		pr_err("%s: failed dsi_panel_driver_create_fs rc=%d\n",
+				__func__, rc);
+		return rc;
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	display->panel = dsi_panel_get(&display->pdev->dev,
 				display->panel_node,
@@ -4243,6 +4339,14 @@ static int dsi_display_res_init(struct dsi_display *display)
 		phy->cfg.split_link.num_sublinks = host->split_link.num_sublinks;
 		phy->cfg.split_link.lanes_per_sublink = host->split_link.lanes_per_sublink;
 	}
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	pr_notice("%s: Panel Name = %s\n", __func__, display->panel->name);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	dsi_panel_driver_oled_short_det_init_works(display);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	rc = dsi_display_parse_lane_map(display);
 	if (rc) {
@@ -5334,6 +5438,9 @@ int dsi_display_cont_splash_config(void *dsi_display)
 	mutex_lock(&display->display_lock);
 
 	display->is_cont_splash_enabled = true;
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	display->panel->spec_pdata->display_onoff_state = true;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	/* Update splash status for clock manager */
 	dsi_display_clk_mngr_update_splash_status(display->clk_mngr,
@@ -5894,6 +6001,9 @@ static int dsi_display_init(struct dsi_display *display)
 			return rc;
 		}
 	}
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	dsi_panel_driver_init_area_count(display->panel);
+#endif  /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	rc = component_add(&pdev->dev, &dsi_display_comp_ops);
 	if (rc)
@@ -6004,6 +6114,10 @@ int dsi_display_dev_probe(struct platform_device *pdev)
 	display->pdev = pdev;
 	display->boot_disp = boot_disp;
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	main_display = display;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 	dsi_display_parse_cmdline_topology(display, index);
 
 	platform_set_drvdata(pdev, display);
@@ -6072,6 +6186,9 @@ int dsi_display_dev_remove(struct platform_device *pdev)
 			ctrl->ctrl->post_cmd_tx_workq = NULL;
 		}
 	}
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	dsi_panel_driver_deinit_area_count(display->panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	(void)_dsi_display_dev_deinit(display);
 

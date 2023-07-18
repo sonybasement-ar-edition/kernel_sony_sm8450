@@ -15,6 +15,7 @@
 #include <linux/usb/phy.h>
 #include <linux/jiffies.h>
 #include <linux/pm_qos.h>
+#include <linux/ipc_logging.h>
 
 #include "sde_connector.h"
 
@@ -34,6 +35,7 @@
 #include "dp_pll.h"
 #include "sde_dbg.h"
 
+#define DRM_DP_IPC_NUM_PAGES 10
 #define DP_MST_DEBUG(fmt, ...) DP_DEBUG(fmt, ##__VA_ARGS__)
 
 #define dp_display_state_show(x) { \
@@ -132,6 +134,10 @@ static char *dp_display_state_name(enum dp_display_states state)
 }
 
 static struct dp_display *g_dp_display;
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+struct device virtualdev;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 #define HPD_STRING_SIZE 30
 
 struct dp_hdcp_dev {
@@ -207,12 +213,152 @@ struct dp_display_private {
 	bool pm_qos_requested;
 
 	struct notifier_block usb_nb;
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	u32 dp_stop_state;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 };
 
 static const struct of_device_id dp_dt_match[] = {
 	{.compatible = "qcom,dp-display"},
 	{}
 };
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+#define VID_SONY (0x054c)
+#define PID_VM0713 (0x0713)
+#define PID_GG0e6d (0x0e6d)
+
+static bool dp_is_excl_acc(u16 dp_vid, u16 dp_pid)
+{
+	return ((dp_vid == VID_SONY && dp_pid == PID_VM0713) ||
+		(dp_vid == VID_SONY && dp_pid == PID_GG0e6d));
+}
+
+static bool dp_is_sony_acc_vm(u16 dp_vid, u16 dp_pid)
+{
+	return (dp_vid == VID_SONY && dp_pid == PID_VM0713);
+}
+
+static bool dp_is_sony_acc_gg(u16 dp_vid, u16 dp_pid)
+{
+	return (dp_vid == VID_SONY && dp_pid == PID_GG0e6d);
+}
+
+static ssize_t dp_display_dp_stop_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct dp_display_private *dp;
+
+	if (dev == NULL) {
+		pr_err("invalid dev\n");
+		return -EINVAL;
+	}
+
+	dp = dev_get_drvdata(dev);
+	if (dp == NULL) {
+		pr_err("no driver data found\n");
+		return -ENODEV;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%08x\n", dp->dp_stop_state);
+}
+
+static void dp_display_host_deinit(struct dp_display_private *dp);
+static void dp_display_disconnect_sync(struct dp_display_private *dp);
+
+static ssize_t dp_display_dp_stop_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dp_display_private *dp;
+
+	if (dev == NULL) {
+		pr_err("invalid dev\n");
+		return -EINVAL;
+	}
+
+	dp = dev_get_drvdata(dev);
+	if (dp == NULL) {
+		pr_err("no driver data found\n");
+		return -ENODEV;
+	}
+
+	if (kstrtou32(buf, 0, &dp->dp_stop_state) < 0) {
+		pr_err("sscanf failed to set dp_stop_state\n");
+		return -EINVAL;
+	}
+	pr_info("dp_stop_state = %08x\n", dp->dp_stop_state);
+
+	/* Stop DP by Thermal client */
+	if (dp->dp_stop_state && dp->hpd->hpd_high &&
+		!dp_is_excl_acc(dp->hpd->vid, dp->hpd->pid)) {
+		pr_info("disconnect DP by Thermal client\n");
+		dp_display_disconnect_sync(dp);
+
+		mutex_lock(&dp->session_lock);
+		dp_display_host_deinit(dp);
+		dp_display_state_remove(DP_STATE_CONFIGURED);
+		mutex_unlock(&dp->session_lock);
+
+		if (!dp->debug->sim_mode && !dp->parser->no_aux_switch
+		    && !dp->parser->gpio_aux_switch)
+			dp->aux->aux_switch(dp->aux, false, ORIENTATION_NONE);
+	}
+
+	return count;
+}
+
+static struct device_attribute dp_attributes[] = {
+	__ATTR(dp_is_stopped, 0664,
+		dp_display_dp_stop_show,
+		dp_display_dp_stop_store),
+};
+
+static int dp_display_register_attributes(struct device *dev)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dp_attributes); i++)
+		if (device_create_file(dev, dp_attributes + i))
+			goto error;
+	return 0;
+
+error:
+	dev_err(dev, "%s: Unable to create interface\n", __func__);
+
+	for (--i; i >= 0 ; i--)
+		device_remove_file(dev, dp_attributes + i);
+	return -ENODEV;
+}
+
+int dp_display_create_fs(struct dp_display_private *dp)
+{
+	int rc = 0;
+	char *path_name = "drm_dp";
+
+	if (dp == NULL) {
+		pr_err("no driver data found\n");
+		return -ENODEV;
+	}
+
+	dev_set_name(&virtualdev, "%s", path_name);
+
+	rc = device_register(&virtualdev);
+	if (rc) {
+		pr_err("%s: device_register failed rc = %d\n", __func__, rc);
+		goto err;
+	}
+
+	rc = dp_display_register_attributes(&virtualdev);
+	if (rc) {
+		device_unregister(&virtualdev);
+		goto err;
+	}
+	dev_set_drvdata(&virtualdev, dp);
+
+err:
+	return rc;
+}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 static inline bool dp_display_is_hdcp_enabled(struct dp_display_private *dp)
 {
@@ -1436,6 +1582,15 @@ static int dp_display_usbpd_configure_cb(struct device *dev)
 		return -ENODEV;
 	}
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	/* check for stop_state */
+	if (dp->dp_stop_state &&
+		!dp_is_excl_acc(dp->hpd->vid, dp->hpd->pid)) {
+		pr_info("dp is stopped (state=%08x)\n", dp->dp_stop_state);
+		return 0;
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 	if (!dp->debug->sim_mode && !dp->parser->no_aux_switch
 	    && !dp->parser->gpio_aux_switch && dp->aux_switch_node) {
 		rc = dp_display_init_aux_switch(dp);
@@ -1847,6 +2002,15 @@ static int dp_display_usbpd_attention_cb(struct device *dev)
 		DP_ERR("no driver data found\n");
 		return -ENODEV;
 	}
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	/* check for stop_state */
+	if (dp->dp_stop_state &&
+		!dp_is_excl_acc(dp->hpd->vid, dp->hpd->pid)) {
+		pr_info("dp is stopped (state=%08x)\n",	dp->dp_stop_state);
+		return 0;
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	DP_DEBUG("hpd_irq:%d, hpd_high:%d, power_on:%d, is_connected:%d\n",
 			dp->hpd->hpd_irq, dp->hpd->hpd_high,
@@ -2271,6 +2435,14 @@ static int dp_display_post_init(struct dp_display *dp_display)
 		rc = -EINVAL;
 		goto end;
 	}
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dp_display_create_fs(dp);
+	if (rc) {
+		pr_err("sysfs create dir failed, rc = %d\n", rc);
+		goto end;
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	rc = dp_init_sub_modules(dp);
 	if (rc)
@@ -2919,11 +3091,117 @@ static int dp_display_validate_topology(struct dp_display_private *dp,
 		return -EPERM;
 	}
 
-	DP_DEBUG("mode %sx%d is valid, supported DP topology lm:%d dsc:%d 3dmux:%d\n",
+	DP_DEBUG_V("mode %sx%d is valid, supported DP topology lm:%d dsc:%d 3dmux:%d\n",
 				mode->name, fps, num_lm, num_dsc, num_3dmux);
 
 	return 0;
 }
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+static enum drm_mode_status dp_validate_mode_ext_861_vic(
+				struct drm_display_mode *mode,
+				enum drm_mode_status cur_status)
+{
+	enum drm_mode_status mode_status = cur_status;
+
+	if (mode_status == MODE_BAD)
+		goto end;
+
+	/* Sony GamingGear supports CTA-861-G Formats only */
+	if ((mode->htotal == 800 && mode->vtotal == 525) ||
+	    /* VGA VIC 1 */
+	    (mode->htotal == 858 && mode->vtotal == 525) ||
+	     /* 480P 16:9 VIC 3, 48 */
+	    (mode->htotal == 1650 && mode->vtotal == 750) ||
+	     /* 720P 16:9 VIC 4, 47 */
+	    (mode->htotal == 2200 && mode->vtotal == 1125) ||
+	     /* 1080P 16:9 VIC 16, 63 */
+	    (mode->htotal == 4400 && mode->vtotal == 2250) ) {
+	     /* 2160P VIC 95, 97, 100, 102 */
+		mode_status = MODE_OK;
+	}
+	else {
+		mode_status = MODE_BAD;
+	}
+ end:
+	return mode_status;
+}
+
+static uint dp_validate_mode;
+module_param_named(dp_validate_mode, dp_validate_mode, uint, 0644);
+MODULE_PARM_DESC(dp_validate_mode, "dp validate mode");
+
+static enum drm_mode_status dp_validate_mode_ext(
+				struct drm_display_mode *mode,
+				u16 dp_vid, u16 dp_pid)
+{
+	enum drm_mode_status mode_status = MODE_BAD;
+	int vrefresh = drm_mode_vrefresh(mode);
+
+	if (dp_is_sony_acc_vm(dp_vid, dp_pid)) {
+		// exclude SONY VM device.
+		mode_status = MODE_OK;
+		goto end;
+	}
+
+	switch (dp_validate_mode) {
+	case 0: /* default valid for Preferred or multi of 30Hz */
+		if (vrefresh % 30 == 0)
+			mode_status = MODE_OK;
+		break;
+	case 1: /* valid for high resolution 30Hz/60Hz */
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		if (vrefresh == 30 ||
+		    vrefresh == 60)
+			mode_status = MODE_OK;
+		break;
+	case 2: /* valid for 120Hz and 480p60Hz */
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		if ((mode->hdisplay <= 1920 &&
+		     vrefresh == 120) ||
+		    (mode->vdisplay <= 480 &&
+		     vrefresh == 60))
+			mode_status = MODE_OK;
+		break;
+	case 3: /* valid for up to FHD/60Hz only */
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		if (mode->hdisplay <= 1920 &&
+		    vrefresh == 60)
+			mode_status = MODE_OK;
+		break;
+	case 4: /* valid for 24/25 Hz only (Test) */
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		if (vrefresh == 24 ||
+		    vrefresh == 25)
+			mode_status = MODE_OK;
+		break;
+	case 5: /* valid for 30 Hz only (Test) */
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		if (vrefresh == 30)
+			mode_status = MODE_OK;
+		break;
+	case 6: /* valid for 90 Hz only (Test) */
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		if (vrefresh == 90)
+			mode_status = MODE_OK;
+		break;
+	case 7: /* valid for 144 Hz only (Test) */
+		mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+		if (vrefresh == 144)
+			mode_status = MODE_OK;
+		break;
+	default:
+		mode_status =  MODE_OK;
+		break;
+	}
+
+	if (dp_is_sony_acc_gg(dp_vid, dp_pid))
+		mode_status = dp_validate_mode_ext_861_vic(mode,
+							   mode_status);
+ end:
+	return mode_status;
+}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 static enum drm_mode_status dp_display_validate_mode(
 		struct dp_display *dp_display,
@@ -2976,10 +3254,15 @@ static enum drm_mode_status dp_display_validate_mode(
 	if (rc)
 		goto end;
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	mode_status = dp_validate_mode_ext(mode, dp->hpd->vid, dp->hpd->pid);
+#else
 	mode_status = MODE_OK;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 end:
 	mutex_unlock(&dp->session_lock);
-	DP_DEBUG("[%s] mode is %s\n", mode->name,
+
+	DP_DEBUG_V("[%s] mode is %s\n", mode->name,
 			(mode_status == MODE_OK) ? "valid" : "invalid");
 
 	return mode_status;
@@ -3002,11 +3285,11 @@ static int dp_display_get_available_dp_resources(struct dp_display *dp_display,
 	max_dp_avail_res->num_dsc = min(avail_res->num_dsc,
 			dp_display->max_dsc_count);
 
-	DP_DEBUG("max_lm:%d, avail_lm:%d, dp_avail_lm:%d\n",
+	DP_DEBUG_V("max_lm:%d, avail_lm:%d, dp_avail_lm:%d\n",
 			dp_display->max_mixer_count, avail_res->num_lm,
 			max_dp_avail_res->num_lm);
 
-	DP_DEBUG("max_dsc:%d, avail_dsc:%d, dp_avail_dsc:%d\n",
+	DP_DEBUG_V("max_dsc:%d, avail_dsc:%d, dp_avail_dsc:%d\n",
 			dp_display->max_dsc_count, avail_res->num_dsc,
 			max_dp_avail_res->num_dsc);
 
@@ -3062,6 +3345,9 @@ static void dp_display_convert_to_dp_mode(struct dp_display *dp_display,
 	free_dsc_blks = dp_display->max_dsc_count -
 				dp->tot_dsc_blks_in_use +
 				dp_panel->dsc_blks_in_use;
+	DP_DEBUG_V("Before: in_use:%d, max:%d, free:%d\n",
+				dp->tot_dsc_blks_in_use,
+				dp_display->max_dsc_count, free_dsc_blks);
 
 	rc = msm_get_dsc_count(dp->priv, drm_mode->hdisplay,
 			&required_dsc_blks);
@@ -3074,7 +3360,7 @@ static void dp_display_convert_to_dp_mode(struct dp_display *dp_display,
 		dp_mode->capabilities |= DP_PANEL_CAPS_DSC;
 
 	if (dp_mode->capabilities & DP_PANEL_CAPS_DSC)
-		DP_DEBUG("in_use:%d, max:%d, free:%d, req:%d, caps:0x%x\n",
+		DP_DEBUG_V("After: in_use:%d, max:%d, free:%d, req:%d, caps:0x%x\n",
 				dp->tot_dsc_blks_in_use,
 				dp_display->max_dsc_count,
 				free_dsc_blks, required_dsc_blks,
@@ -3594,6 +3880,10 @@ static int dp_display_probe(struct platform_device *pdev)
 
 	g_dp_display = &dp->dp_display;
 
+	g_dp_display->dp_ipc_log = ipc_log_context_create(DRM_DP_IPC_NUM_PAGES, "drm_dp", 0);
+	if (!g_dp_display->dp_ipc_log)
+		DP_WARN("Error in creating ipc_log_context\n");
+
 	g_dp_display->enable        = dp_display_enable;
 	g_dp_display->post_enable   = dp_display_post_enable;
 	g_dp_display->pre_disable   = dp_display_pre_disable;
@@ -3705,6 +3995,11 @@ static int dp_display_remove(struct platform_device *pdev)
 	platform_set_drvdata(pdev, NULL);
 	devm_kfree(&pdev->dev, dp);
 
+	if (g_dp_display->dp_ipc_log) {
+		ipc_log_context_destroy(g_dp_display->dp_ipc_log);
+		g_dp_display->dp_ipc_log = NULL;
+	}
+
 	return 0;
 }
 
@@ -3764,6 +4059,13 @@ static void dp_pm_complete(struct device *dev)
 	dp_display_state_remove(DP_STATE_SUSPENDED);
 	mutex_unlock(&dp->session_lock);
 	SDE_EVT32_EXTERNAL(SDE_EVTLOG_FUNC_EXIT, dp->state);
+}
+
+void *get_ipc_log_context(void)
+{
+	if (g_dp_display && g_dp_display->dp_ipc_log)
+		return g_dp_display->dp_ipc_log;
+	return NULL;
 }
 
 static const struct dev_pm_ops dp_pm_ops = {

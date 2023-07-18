@@ -56,6 +56,10 @@
 #include "sde_wb.h"
 #include "sde_dbg.h"
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+#include "dsi/dsi_panel_driver.h"
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 /*
  * MSM driver version:
  * - 1.0.0 - initial interface
@@ -927,6 +931,10 @@ static int msm_drm_component_init(struct device *dev)
 
 	drm_kms_helper_poll_init(ddev);
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	incell_driver_init(priv);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 	return 0;
 
 fail:
@@ -1060,10 +1068,8 @@ static void msm_lastclose(struct drm_device *dev)
 				priv->pending_crtcs);
 
 		rc = kms->funcs->trigger_null_flush(kms);
-		if (rc) {
-			DRM_ERROR("null flush commit failure during lastclose\n");
+		if (rc)
 			return;
-		}
 	}
 
 	/*
@@ -2202,8 +2208,8 @@ static void msm_pdev_shutdown(struct platform_device *pdev)
 	}
 
 	priv = ddev->dev_private;
-	if (!priv) {
-		DRM_ERROR("invalid msm drm private node\n");
+	if (!priv || !priv->registered) {
+		DRM_ERROR("invalid msm drm private node or drm dev not registered\n");
 		return;
 	}
 

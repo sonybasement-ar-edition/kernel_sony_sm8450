@@ -10,6 +10,7 @@
 #include <linux/of_gpio.h>
 #include <linux/pwm.h>
 #include <video/mipi_display.h>
+#include <misc/isl97900_led.h>
 
 #include "dsi_panel.h"
 #include "dsi_ctrl_hw.h"
@@ -17,6 +18,10 @@
 #include "sde_dbg.h"
 #include "sde_dsc_helper.h"
 #include "sde_vdc_helper.h"
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+#include "dsi_panel_driver.h"
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 /**
  * topology is currently defined by a set of following 3 values:
@@ -38,6 +43,9 @@
 #define MIN_PREFILL_LINES      40
 #define RSCC_MODE_THRESHOLD_TIME_US 40
 #define DCS_COMMAND_THRESHOLD_TIME_US 40
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+#define AOD_MODE_THRESHOLD 35
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 static void dsi_dce_prepare_pps_header(char *buf, u32 pps_delay_ms)
 {
@@ -253,8 +261,15 @@ static int dsi_panel_trigger_esd_attack(struct dsi_panel *panel)
 	return dsi_panel_trigger_esd_attack_sub(r_config->reset_gpio);
 }
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+int dsi_panel_reset(struct dsi_panel *panel)
+#else
 static int dsi_panel_reset(struct dsi_panel *panel)
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 {
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	return dsi_panel_driver_reset_panel(panel, true);
+#else
 	int rc = 0;
 	struct dsi_panel_reset_config *r_config = &panel->reset_config;
 	int i;
@@ -324,9 +339,14 @@ skip_reset_gpio:
 
 exit:
 	return rc;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 }
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+int dsi_panel_set_pinctrl_state(struct dsi_panel *panel, bool enable)
+#else
 static int dsi_panel_set_pinctrl_state(struct dsi_panel *panel, bool enable)
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 {
 	int rc = 0;
 	struct pinctrl_state *state;
@@ -353,6 +373,9 @@ static int dsi_panel_set_pinctrl_state(struct dsi_panel *panel, bool enable)
 
 static int dsi_panel_power_on(struct dsi_panel *panel)
 {
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	return dsi_panel_driver_power_on(panel);
+#else
 	int rc = 0;
 
 	rc = dsi_pwr_enable_regulator(&panel->power_info, true);
@@ -390,10 +413,14 @@ error_disable_vregs:
 
 exit:
 	return rc;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 }
 
 static int dsi_panel_power_off(struct dsi_panel *panel)
 {
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	return dsi_panel_driver_power_off(panel);
+#else
 	int rc = 0;
 
 	if (gpio_is_valid(panel->reset_config.disp_en_gpio))
@@ -425,9 +452,84 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 				panel->name, rc);
 
 	return rc;
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 }
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+int dsi_panel_tx_cmd(struct dsi_panel *panel,
+				struct dsi_cmd_desc *cmds)
+{
+	int rc = 0;
+	ssize_t len;
+	const struct mipi_dsi_host_ops *ops = panel->host->ops;
+
+	cmds->msg.flags |= (MIPI_DSI_MSG_USE_LPM | MIPI_DSI_MSG_LASTCOMMAND);
+
+	len = ops->transfer(panel->host, &cmds->msg);
+	if (len < 0) {
+		rc = len;
+		pr_err("failed to transfer cmds, rc=%d\n", rc);
+		goto error;
+	}
+	if (cmds->post_wait_ms)
+		msleep(cmds->post_wait_ms);
+error:
+	return rc;
+}
+
+int dsi_panel_rx_cmd(struct dsi_display *display, struct dsi_cmd_desc *cmds,
+				struct dsi_display_ctrl *ctrl, char *rbuf,
+				int len)
+{
+	int rc = 0;
+	ssize_t reslen;
+
+	dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_ALL_CLKS, DSI_CLK_ON);
+
+	rc = dsi_display_cmd_engine_enable(display);
+	if (rc) {
+		pr_err("cmd engine enable failed\n");
+		return -EPERM;
+	}
+	cmds->ctrl_flags = (DSI_CTRL_CMD_FETCH_MEMORY |
+                            DSI_CTRL_CMD_READ | DSI_CTRL_CMD_LAST_COMMAND);
+	cmds->msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+	cmds->msg.rx_buf = rbuf;
+	cmds->msg.rx_len = len;
+	pr_debug("%s: tx = %x\n", __func__, *(char *)(cmds->msg.tx_buf));
+	reslen = dsi_ctrl_cmd_transfer(ctrl->ctrl, cmds);
+
+	if (reslen < 0) {
+		rc = reslen;
+		pr_err("%s: failed to transfer cmds, rc=%d\n", __func__, rc);
+		goto error;
+	}
+	if (cmds->post_wait_ms)
+		msleep(cmds->post_wait_ms);
+
+	pr_debug("%s: rx = %x\n", __func__, *(char *)(cmds->msg.rx_buf));
+	pr_debug("%s: flags = %d, post_wait_ms = %d, rbuf = %x\n", __func__,
+		cmds->msg.flags, cmds->post_wait_ms, *rbuf);
+
+	dsi_display_cmd_engine_disable(display);
+
+	dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_ALL_CLKS, DSI_CLK_OFF);
+
+error:
+	return rc;
+}
+
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
+				enum dsi_cmd_set_type type)
+#else
 static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
 				enum dsi_cmd_set_type type)
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 {
 	int rc = 0, i = 0;
 	ssize_t len;
@@ -528,6 +630,9 @@ static int dsi_panel_pinctrl_init(struct dsi_panel *panel)
 		DSI_DEBUG("failed to get pinctrl pwm_pin");
 	}
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_pinctrl_init(panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 error:
 	return rc;
 }
@@ -578,6 +683,28 @@ static int dsi_panel_update_backlight(struct dsi_panel *panel,
 
 	return rc;
 }
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+static int dsi_panel_set_aod_change(struct dsi_panel *panel, u32 bl_lvl)
+{
+	int rc = 0;
+
+	if (!panel) {
+		pr_err("invalid params\n");
+		return -EINVAL;
+	}
+
+	if (bl_lvl < AOD_MODE_THRESHOLD)
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_AOD_LOW);
+	else
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_AOD_HIGH);
+
+	if (rc)
+		pr_err("[%s] failed to send DSI_CMD_SET_AOD_LOW or HIGH cmd, rc=%d\n",
+		       panel->name, rc);
+	return rc;
+}
+#endif //CONFIG_DRM_SDE_SPECIFIC_PANEL
 
 static int dsi_panel_update_pwm_backlight(struct dsi_panel *panel,
 	u32 bl_lvl)
@@ -639,6 +766,27 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		return 0;
 
 	DSI_DEBUG("backlight type:%d lvl:%d\n", bl->type, bl_lvl);
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	if (panel->spec_pdata->aod_mode)
+		return dsi_panel_set_aod_change(panel, bl_lvl);
+
+	if (bl_lvl > panel->spec_pdata->thermal_limit) {
+		pr_info("[%s]Limit brightness, bl_lvl %d to %d\n",
+			__func__, bl_lvl, panel->spec_pdata->thermal_limit);
+		bl_lvl = panel->spec_pdata->thermal_limit;
+	}
+
+	if (panel->spec_pdata->flash_br) {
+		pr_info("[%s]Override brightness for display flash. bl_lvl %d to %d\n",
+			__func__, bl_lvl, panel->spec_pdata->flash_br);
+		bl_lvl = panel->spec_pdata->flash_br;
+	}
+
+	//Adjust register value considering min/max reg val and hmd status
+	bl_lvl = dsi_panel_driver_adjust_brightness(panel, bl_lvl);
+
+	dsi_panel_driver_panel_update_area(panel, bl_lvl);
+#endif
 	switch (bl->type) {
 	case DSI_BACKLIGHT_WLED:
 		rc = backlight_device_set_brightness(bl->raw_bd, bl_lvl);
@@ -650,6 +798,15 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		break;
 	case DSI_BACKLIGHT_PWM:
 		rc = dsi_panel_update_pwm_backlight(panel, bl_lvl);
+		break;
+	case DSI_BACKLIGHT_I2C:
+		if (panel->rgb_left_led_node)
+			isl97900_led_event(panel->rgb_left_led_node,
+					0, bl_lvl);
+
+		if (panel->rgb_right_led_node)
+			isl97900_led_event(panel->rgb_right_led_node,
+					0, bl_lvl);
 		break;
 	default:
 		DSI_ERR("Backlight type(%d) not supported\n", bl->type);
@@ -676,6 +833,7 @@ static u32 dsi_panel_get_brightness(struct dsi_backlight_config *bl)
 	case DSI_BACKLIGHT_DCS:
 	case DSI_BACKLIGHT_EXTERNAL:
 	case DSI_BACKLIGHT_PWM:
+	case DSI_BACKLIGHT_I2C:
 	default:
 		/*
 		 * Ideally, we should read the backlight level from the
@@ -741,6 +899,26 @@ static int dsi_panel_parse_fsc_rgb_order(struct dsi_panel *panel,
 	return rc;
 }
 
+static int dsi_panel_parse_rgb_led(struct dsi_panel *panel,
+		struct device_node *of_node)
+{
+	int rc = 0;
+
+	if (!panel || !of_node)
+		return -EINVAL;
+
+	if (panel->bl_config.type != DSI_BACKLIGHT_I2C)
+		return 0;
+
+	panel->rgb_left_led_node = of_parse_phandle(of_node,
+		"qcom,panel-rgb-left-led", 0);
+
+	panel->rgb_right_led_node = of_parse_phandle(of_node,
+		"qcom,panel-rgb-right-led", 0);
+
+	return rc;
+}
+
 static int dsi_panel_bl_register(struct dsi_panel *panel)
 {
 	int rc = 0;
@@ -759,6 +937,8 @@ static int dsi_panel_bl_register(struct dsi_panel *panel)
 		break;
 	case DSI_BACKLIGHT_PWM:
 		rc = dsi_panel_pwm_register(panel);
+		break;
+	case DSI_BACKLIGHT_I2C:
 		break;
 	default:
 		DSI_ERR("Backlight type(%d) not supported\n", bl->type);
@@ -794,6 +974,8 @@ static int dsi_panel_bl_unregister(struct dsi_panel *panel)
 		break;
 	case DSI_BACKLIGHT_PWM:
 		dsi_panel_pwm_unregister(panel);
+		break;
+	case DSI_BACKLIGHT_I2C:
 		break;
 	default:
 		DSI_ERR("Backlight type(%d) not supported\n", bl->type);
@@ -933,6 +1115,11 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 		DSI_DEBUG("qsync min fps not defined in timing node\n");
 		rc = 0;
 	}
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	display_mode->priv_info->aod_switch_enable = utils->read_bool(utils->data,
+								"somc,aod-switch-enable");
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	DSI_DEBUG("panel vert active:%d front_portch:%d back_porch:%d pulse_width:%d\n",
 		mode->v_active, mode->v_front_porch, mode->v_back_porch,
@@ -1886,6 +2073,18 @@ const char *cmd_set_prop_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-post-mode-switch-on-command",
 	"qcom,mdss-dsi-qsync-on-commands",
 	"qcom,mdss-dsi-qsync-off-commands",
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	"somc,mdss-dsi-hbm-on-command",
+	"somc,mdss-dsi-hbm-off-command",
+	"somc,mdss-dsi-flm2-on-command",
+	"somc,mdss-dsi-flm2-off-command",
+	"somc,mdss-dsi-hmd-mode1-command",
+	"somc,mdss-dsi-hmd-mode2-command",
+	"somc,mdss-dsi-hmd-off-command",
+	"somc,mdss-dsi-aod-low-command",
+	"somc,mdss-dsi-aod-high-command",
+	"somc,mdss-dsi-timing-switch-command-aod",
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 };
 
 const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
@@ -1914,6 +2113,18 @@ const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-post-mode-switch-on-command-state",
 	"qcom,mdss-dsi-qsync-on-commands-state",
 	"qcom,mdss-dsi-qsync-off-commands-state",
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	"somc,mdss-dsi-hbm-on-command-state",
+	"somc,mdss-dsi-hbm-off-command-state",
+	"somc,mdss-dsi-flm2-on-command-state",
+	"somc,mdss-dsi-flm2-off-command-state",
+	"somc,mdss-dsi-hmd-mode1-command-state",
+	"somc,mdss-dsi-hmd-mode2-command-state",
+	"somc,mdss-dsi-hmd-off-command-state",
+	"somc,mdss-dsi-aod-low-command-state",
+	"somc,mdss-dsi-aod-high-command-state",
+	"somc,mdss-dsi-timing-switch-command-aod-state",
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 };
 
 int dsi_panel_get_cmd_pkt_count(const char *data, u32 length, u32 *cnt)
@@ -2414,6 +2625,15 @@ static int dsi_panel_parse_gpios(struct dsi_panel *panel)
 		DSI_DEBUG("%s:%d panel test gpio not specified\n", __func__,
 			 __LINE__);
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_parse_gpios(panel);
+	if (rc) {
+		pr_err("%s: failed to parse specific parameters, rc=%d\n",
+		       __func__, rc);
+		goto error;
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 error:
 	return rc;
 }
@@ -2463,6 +2683,8 @@ static int dsi_panel_parse_bl_config(struct dsi_panel *panel)
 		panel->bl_config.type = DSI_BACKLIGHT_DCS;
 	} else if (!strcmp(bl_type, "bl_ctrl_external")) {
 		panel->bl_config.type = DSI_BACKLIGHT_EXTERNAL;
+	} else if (!strcmp(bl_type, "bl_ctrl_i2c")) {
+		panel->bl_config.type = DSI_BACKLIGHT_I2C;
 	} else {
 		DSI_DEBUG("[%s] bl-pmic-control-type unknown-%s\n",
 			 panel->name, bl_type);
@@ -2514,6 +2736,21 @@ static int dsi_panel_parse_bl_config(struct dsi_panel *panel)
 	} else {
 		panel->bl_config.brightness_max_level = val;
 	}
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	//Save max brightness to thermal limit for brightness as initial value
+	panel->spec_pdata->thermal_limit = panel->bl_config.brightness_max_level;
+
+	//Set Initial Brightness for JIML-322086
+	rc = utils->read_u32(utils->data, "somc,default-brightness-level", &val);
+	if (rc) {
+		DSI_DEBUG("[%s] default-brightness-level unspecified, defaulting to max brigthness\n",
+			 panel->name);
+		panel->bl_config.default_brightness_level = panel->bl_config.brightness_max_level;
+		rc = 0;
+	} else {
+		panel->bl_config.default_brightness_level = val;
+	}
+#endif
 
 	panel->bl_config.bl_inverted_dbv = utils->read_bool(utils->data,
 		"qcom,mdss-dsi-bl-inverted-dbv");
@@ -3470,6 +3707,8 @@ static int dsi_panel_parse_esd_config(struct dsi_panel *panel)
 				rc = -EINVAL;
 				goto error;
 			}
+		} else if (!strcmp(string, "esd_sw_sim_success")) {
+			esd_config->status_mode = ESD_MODE_SW_SIM_SUCCESS;
 		} else {
 			DSI_ERR("No valid panel-status-check-mode string\n");
 			rc = -EINVAL;
@@ -3572,6 +3811,17 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 
 	dsi_panel_setup_vm_ops(panel, trusted_vm_env);
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	panel->spec_pdata = kzalloc(
+				sizeof(struct panel_specific_pdata),
+				GFP_KERNEL);
+	if (!panel->spec_pdata) {
+		pr_err("%s Unable to alloc spec_pdata\n", __func__);
+		kfree(panel);
+		return ERR_PTR(-ENOMEM);
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 	panel->panel_of_node = of_node;
 	panel->parent = parent;
 	panel->type = type;
@@ -3672,6 +3922,10 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	if (rc)
 		DSI_DEBUG("failed to read fsc color order, rc=%d\n", rc);
 
+	rc = dsi_panel_parse_rgb_led(panel, of_node);
+	if (rc)
+		DSI_DEBUG("failed to get rgb led info, rc=%d\n", rc);
+
 	rc = dsi_panel_vreg_get(panel);
 	if (rc) {
 		DSI_ERR("[%s] failed to get panel regulators, rc=%d\n",
@@ -3680,6 +3934,13 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	}
 
 	panel->power_mode = SDE_MODE_DPMS_OFF;
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_parse_dt(panel, of_node);
+	if (rc)
+		pr_err("failed to parse panel specific, rc=%d\n", rc);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 	drm_panel_init(&panel->drm_panel, &panel->mipi_device.dev,
 			NULL, DRM_MODE_CONNECTOR_DSI);
 	panel->mipi_device.dev.of_node = of_node;
@@ -3753,8 +4014,18 @@ int dsi_panel_drv_init(struct dsi_panel *panel,
 		goto error_gpio_release;
 	}
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_gpio_request(panel);
+	if (rc) {
+		pr_err("%s: failed to request gpios, rc=%d\n", __func__,
+		       rc);
+		goto error_pinctrl_deinit;
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 	goto exit;
-
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	(void)dsi_panel_driver_gpio_release(panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 error_gpio_release:
 	(void)dsi_panel_gpio_release(panel);
 error_pinctrl_deinit:
@@ -3786,6 +4057,15 @@ int dsi_panel_drv_deinit(struct dsi_panel *panel)
 		       rc);
 
 	rc = panel->panel_ops.pinctrl_deinit(panel);
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_gpio_release(panel);
+	if (rc)
+		pr_err("%s: failed to release gpios, rc=%d\n", __func__,
+		       rc);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
+	rc = dsi_panel_pinctrl_deinit(panel);
 	if (rc)
 		DSI_ERR("[%s] failed to deinit gpios, rc=%d\n", panel->name,
 		       rc);
@@ -4224,6 +4504,11 @@ int dsi_panel_get_mode(struct dsi_panel *panel,
 		rc = dsi_panel_parse_partial_update_caps(mode, utils);
 		if (rc)
 			DSI_ERR("failed to partial update caps, rc=%d\n", rc);
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+		mode->default_timing = of_property_read_bool(child_np,
+				"qcom,mdss-dsi-timing-default");
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 	}
 	goto done;
 
@@ -4292,6 +4577,10 @@ int dsi_panel_pre_prepare(struct dsi_panel *panel)
 	}
 
 	mutex_lock(&panel->panel_lock);
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_pre_power_on(panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	/* If LP11_INIT is set, panel will be powered up during prepare() */
 	if (panel->lp11_init)
@@ -4380,9 +4669,19 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 		dsi_pwr_panel_regulator_mode_set(&panel->power_info,
 			"ibb", REGULATOR_MODE_IDLE);
 	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_LP1);
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	if (rc) {
+		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
+		       panel->name, rc);
+	} else {
+		panel->spec_pdata->aod_mode = 1;
+		pr_notice("%s: set AOD mode ON\n", __func__);
+	}
+#else
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
 		       panel->name, rc);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4432,13 +4731,143 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 		dsi_pwr_panel_regulator_mode_set(&panel->power_info,
 			"ibb", REGULATOR_MODE_NORMAL);
 	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_NOLP);
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	if (rc) {
+		DSI_ERR("[%s] failed to send DSI_CMD_SET_NOLP cmd, rc=%d\n",
+		       panel->name, rc);
+	} else {
+		panel->spec_pdata->aod_mode = 0;
+		pr_notice("%s: set AOD mode OFF\n", __func__);
+	}
+#else
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_NOLP cmd, rc=%d\n",
 		       panel->name, rc);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
 }
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+int dsi_panel_set_hbm_mode(struct dsi_panel *panel, int mode)
+{
+	int rc = 0;
+
+	if (panel == NULL) {
+		pr_err("invalid params\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&panel->panel_lock);
+	rc = dsi_panel_set_hbm_mode_core(panel, mode);
+	mutex_unlock(&panel->panel_lock);
+
+	return rc;
+}
+
+int dsi_panel_set_hbm_mode_core(struct dsi_panel *panel, int mode)
+{
+	int rc = 0;
+
+	if (panel == NULL) {
+		pr_err("invalid params\n");
+		return -EINVAL;
+	}
+
+	if (!panel->spec_pdata->display_onoff_state) {
+		pr_err("%s: Display is off, can't set HBM mode\n", __func__);
+		return -EAGAIN;
+	}
+
+	rc = (mode == 0) ? dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_OFF) :
+			dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HBM_ON);
+
+	if (rc != 0)
+		pr_err("[%s] failed to send DSI_CMD_SET_HBM_XX(%d) cmd, rc=%d\n",
+			panel->name, mode, rc);
+	else {
+		panel->spec_pdata->hbm_mode = mode;
+		pr_notice("set HBM mode=%d\n", mode);
+	}
+
+	return rc;
+}
+
+int dsi_panel_set_flm2_mode(struct dsi_panel *panel, int mode)
+{
+	int rc = 0;
+
+	if (panel == NULL) {
+		pr_err("invalid params\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&panel->panel_lock);
+	if (!panel->spec_pdata->display_onoff_state) {
+		pr_err("%s: Display is off, can't set FLM2 mode\n", __func__);
+		mutex_unlock(&panel->panel_lock);
+		return -EAGAIN;
+	}
+
+	rc = (mode == 0) ? dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_FLM2_OFF) :
+			dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_FLM2_ON);
+
+	if (rc != 0) {
+		pr_err("[%s] failed to send DSI_CMD_SET_FLM2_%s cmd, rc=%d\n", panel->name, mode == 0 ? "OFF" : "ON", rc);
+	} else {
+		pr_notice("set FLM2 mode=%d\n", mode);
+	}
+	mutex_unlock(&panel->panel_lock);
+
+	return rc;
+
+}
+
+int dsi_panel_set_hmd_mode(struct dsi_panel *panel, int mode)
+{
+	int rc = 0;
+
+	if (panel == NULL) {
+		pr_err("invalid params\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&panel->panel_lock);
+	if (!panel->spec_pdata->display_onoff_state) {
+		pr_err("%s: Display is off, can't set HMD mode\n", __func__);
+		mutex_unlock(&panel->panel_lock);
+		return -EAGAIN;
+	}
+
+	switch(mode){
+		case HMD_OFF:
+			rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HMD_OFF);
+			break;
+		case HMD_MODE1:
+			rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HMD_MODE1);
+			break;
+		case HMD_MODE2:
+			rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_HMD_MODE2);
+			break;
+		default:
+			pr_err("[%s] this mode is invalid value, mode = %d\n", __func__, mode);
+			mutex_unlock(&panel->panel_lock);
+			return -EINVAL;
+	}
+
+	if (rc != 0) {
+		pr_err("[%s] failed to send DSI_CMD_SET_HMD_XX(%d) cmd, rc=%d\n",
+			panel->name, mode, rc);
+	} else {
+		panel->spec_pdata->hmd_mode = mode;
+		pr_notice("%s: set HMD mode=%d\n", __func__, mode);
+	}
+	mutex_unlock(&panel->panel_lock);
+
+	return rc;
+}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 int dsi_panel_prepare(struct dsi_panel *panel)
 {
@@ -4723,7 +5152,13 @@ int dsi_panel_switch(struct dsi_panel *panel)
 
 	mutex_lock(&panel->panel_lock);
 
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_tx_cmd_set(panel, (panel->spec_pdata->aod_mode &&
+				panel->cur_mode->priv_info->aod_switch_enable) ?
+			DSI_CMD_SET_TIMING_SWITCH_AOD : DSI_CMD_SET_TIMING_SWITCH);
+#else /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_TIMING_SWITCH);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_TIMING_SWITCH cmds, rc=%d\n",
 		       panel->name, rc);
@@ -4809,6 +5244,12 @@ int dsi_panel_post_enable(struct dsi_panel *panel)
 		       panel->name, rc);
 		goto error;
 	}
+
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	dsi_panel_driver_post_enable(panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 error:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4834,6 +5275,10 @@ int dsi_panel_pre_disable(struct dsi_panel *panel)
 		       panel->name, rc);
 		goto error;
 	}
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	dsi_panel_driver_pre_disable(panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 error:
 	mutex_unlock(&panel->panel_lock);
@@ -4877,6 +5322,10 @@ int dsi_panel_disable(struct dsi_panel *panel)
 	}
 	panel->panel_initialized = false;
 	panel->power_mode = SDE_MODE_DPMS_OFF;
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	dsi_panel_driver_disable(panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4922,6 +5371,11 @@ int dsi_panel_post_unprepare(struct dsi_panel *panel)
 		       panel->name, rc);
 		goto error;
 	}
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	rc = dsi_panel_driver_post_power_off(panel);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
+
 error:
 	mutex_unlock(&panel->panel_lock);
 	return rc;

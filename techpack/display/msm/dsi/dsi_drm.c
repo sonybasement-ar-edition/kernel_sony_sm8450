@@ -880,9 +880,12 @@ int dsi_conn_set_info_blob(struct drm_connector *connector,
 				mode_info->roi_caps.merge_rois);
 	}
 
-	if (DSI_IS_FSC_PANEL(panel->fsc_rgb_order))
+	if (DSI_IS_FSC_PANEL(panel->fsc_rgb_order)) {
 		sde_kms_info_add_keystr(info, "fsc rgb color order",
 			panel->fsc_rgb_order);
+		sde_kms_info_add_keystr(info, "is fsc panel", "true");
+		sde_kms_info_add_keyint(info, "num fsc fields", 3);
+	}
 
 	fmt = dsi_display->config.common_config.dst_format;
 	bpp = dsi_ctrl_pixel_format_to_bpp(fmt);
@@ -1171,6 +1174,11 @@ int dsi_connector_get_modes(struct drm_connector *connector, void *data,
 			m->type |= DRM_MODE_TYPE_PREFERRED;
 		}
 		drm_mode_probed_add(connector, m);
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+		if (modes[i].default_timing)
+			drm_set_preferred_mode(
+				connector, m->hdisplay, m->vdisplay);
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 	}
 
 	rc = dsi_drm_update_edid_name(&edid, display->panel->name);

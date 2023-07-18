@@ -814,6 +814,34 @@ static int sde_hw_intf_v1_check_and_reset_tearcheck(struct sde_hw_intf *intf,
 	return 0;
 }
 
+static void sde_hw_intf_override_tear_rd_ptr_val(struct sde_hw_intf *intf,
+		u32 adjusted_rd_ptr_val)
+{
+	struct sde_hw_blk_reg_map *c;
+
+	if (!intf || !adjusted_rd_ptr_val)
+		return;
+
+	c = &intf->hw;
+
+	SDE_REG_WRITE(c, INTF_TEAR_SYNC_WRCOUNT, (adjusted_rd_ptr_val & 0xFFFF));
+	/* ensure rd_ptr_val is written */
+	wmb();
+}
+
+static void sde_hw_intf_reset_tear_init_line_val(struct sde_hw_intf *intf,
+		u32 init_val)
+{
+	struct sde_hw_blk_reg_map *c;
+
+	if (!intf || !init_val)
+		return;
+
+	c = &intf->hw;
+
+	SDE_REG_WRITE(c, INTF_TEAR_SYNC_WRCOUNT, (init_val & 0xFFFF));
+}
+
 static void sde_hw_intf_vsync_sel(struct sde_hw_intf *intf,
 		u32 vsync_source)
 {
@@ -912,6 +940,9 @@ static void _setup_intf_ops(struct sde_hw_intf_ops *ops,
 		ops->vsync_sel = sde_hw_intf_vsync_sel;
 		ops->check_and_reset_tearcheck =
 			sde_hw_intf_v1_check_and_reset_tearcheck;
+		ops->override_tear_rd_ptr_val =
+			sde_hw_intf_override_tear_rd_ptr_val;
+		ops->reset_tear_init_line_val = sde_hw_intf_reset_tear_init_line_val;
 	}
 
 	if (cap & BIT(SDE_INTF_RESET_COUNTER))
