@@ -1,21 +1,21 @@
-EXTRA_CFLAGS += -I$(SONY_CAMERA_ROOT)/include
+EXTRA_CFLAGS += -I$(srctree)/drivers/sony/sony_camera/include
 ccflags-y += ${ccflags-m}
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/include
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/include/uapi
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/include/uapi/camera
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_utils
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_core
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_cpas/include
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_presil/inc
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_sensor_module/cam_cci
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_sensor_module/cam_csiphy
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_sensor_module/cam_sensor_io
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_sensor_module/cam_sensor_utils
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_smmu
-ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_req_mgr
+ccflags-y += -I$(srctree)/techpack/camera
+ccflags-y += -I$(srctree)/techpack/camera/include
+ccflags-y += -I$(srctree)/techpack/camera/include/uapi
+ccflags-y += -I$(srctree)/techpack/camera/include/uapi/camera
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_utils
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_core
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_cpas/include
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_presil/inc
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_sensor_module/cam_cci
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_sensor_module/cam_csiphy
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_sensor_module/cam_sensor_io
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_sensor_module/cam_sensor_utils
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_smmu
+ccflags-y += -I$(srctree)/techpack/camera/drivers/cam_req_mgr
 ccflags-y += -DCONFIG_SPECTRA_CAMERA=y
-ifeq ($(findstring pdx223, $(PRODUCT)), pdx223)
+ifeq ($(CONFIG_MACH_SONY_PDX223),y)
 ccflags-y += -DUSE_CAMERA_4
 endif
 
